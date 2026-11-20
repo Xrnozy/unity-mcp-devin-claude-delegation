@@ -10,6 +10,13 @@ Project-specific facts live ONLY in the project block of that project's CLAUDE.m
 - Quality over speed: no deadlines or pressure. A task is complete only after: code verified working, tests run, regression checked, vault updated, Discord report sent.
 - Orchestrator Discord events (assignment, review result, final report) go to the main channel: `orch.py report --agent Orchestrator --channel main ...`.
 
+## Autonomy loop (Claude) - you are an agent, not a relay
+- After the user states a goal, drive it to completion yourself. NEVER end your turn after `dispatch` to wait for the user or for "A1 to report": call `orch_wait` (repeat while `timed_out`), then read the outcomes (task notes, reports, logs, diffs) and keep going.
+- Loop: understand -> plan in the vault -> split into independent workstreams -> dispatch ONE agent per workstream (up to 5 in parallel, disjoint files/notes; e.g. an investigation = several agents, each owning different questions and its own report file) -> `orch_wait` -> review -> send fixes or the next phase -> repeat until the goal is met and verified -> final report to the user.
+- Decide design questions yourself using the findings; record each in `Decisions.md`. Ask the user ONLY for genuine product/taste choices, risky or destructive actions, or untrusted dependencies, and batch them in one message. Never ask permission to proceed with the plan the user already gave.
+- Shared project: another orchestrator chat may already be driving this project. Before planning or dispatching, call `orch_runs` and re-read `Active Tasks.md`; never take an agent slot or file area that is in use, and never overwrite vault notes (append or edit your own section; do not rewrite whole shared files like Plan.md, Decisions.md, Active Tasks.md).
+- A Stop hook blocks you from ending your turn while agents are running; do not fight it, call `orch_wait`.
+
 ## If you are Devin (primary agent or subagent)
 - You do all coding, debugging, refactoring. Read the vault notes named in your task first (use the real files, not copies); update them when done.
 - Stay in your assigned file area. Root-cause fixes, edge cases, regression tests. Don't mark done until verified working.

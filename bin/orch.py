@@ -154,7 +154,7 @@ def init_project(d, vault_override=None):
     reg.write_text(json.dumps(r, indent=2), encoding="utf-8")
     # Claude hooks in project .claude/settings.json (read by Claude Desktop AND CLI): merge, back up, never clobber
     me = f'python "{Path(__file__).resolve()}"'
-    want = {"SessionStart": ("", f"{me} context"), "PreToolUse": ("Edit|Write|NotebookEdit|mcp__unityMCP__(create_script|delete_script|apply_text_edits|script_apply_edits|manage_script|manage_shader|execute_code|execute_custom_tool|batch_execute)", f"{me} guard")}
+    want = {"SessionStart": ("", f"{me} context"), "PreToolUse": ("Edit|Write|NotebookEdit|mcp__unityMCP__(create_script|delete_script|apply_text_edits|script_apply_edits|manage_script|manage_shader|execute_code|execute_custom_tool|batch_execute)", f"{me} guard"), "Stop": ("", f"{me} stop-guard")}
     cs = d / ".claude" / "settings.json"
     old_txt = cs.read_text(encoding="utf-8-sig") if cs.exists() else ""
     try:
@@ -297,6 +297,10 @@ def cmd_report(a):
 
 
 # ---------- Devin hooks (stdin JSON) ----------
+DENY = re.compile(r"(\brm\s+-\w*[rf]\w*\s|\bgit\s+(reset\s+--hard|clean\s+-\w*f|push|restore|checkout\s+--)|\bRemove-Item\b.*-Recurse|\brmdir\s+/s|\bdel\s+/[sq]|\bformat\s+[a-z]:|\b(npm|pnpm|yarn)\s+(i|install|add)\b|\bpip3?\s+install\b|\bcurl\b.*\|\s*(sh|bash)|\bInvoke-Expression\b|\biex\b)", re.I)
+BLOCK_MSG = "Blocked by orchestrator safety policy (destructive command or dependency install). Do not retry. Set your task note status to 'waiting', explain what you need and why, and finish; the orchestrator will ask the user."
+
+
 def cmd_hook(a):
     try:
         ev = json.loads(sys.stdin.buffer.read().decode("utf-8-sig") or "{}")
@@ -309,6 +313,13 @@ def cmd_hook(a):
     agent, task = os.environ["ORCH_AGENT"], os.environ.get("ORCH_TASK", "")
     run = d / ".orch" / "runs" / f"{agent}.json"
     st = json.loads(run.read_text()) if run.exists() else {}
+    if a.event == "PreToolUse":
+        cmd = (ev.get("tool_input") or {}).get("command") or ""
+        if (ev.get("tool_name") or "").lower() in ("exec", "bash", "shell") and DENY.search(cmd):
+            send({"agent": agent, "task": task, "status": "waiting", "title": "Blocked risky command",
+                  "note": cmd[:200]}, d, cfg)
+            print(json.dumps({"decision": "block", "reason": BLOCK_MSG}))
+        return
     if a.event == "PostToolUse":
         tool = (ev.get("tool_name") or "").lower()
         if any(k in tool for k in ("edit", "write", "patch")):
@@ -325,9 +336,11 @@ def cmd_hook(a):
             print(json.dumps({"decision": "block", "reason": f"Update your task note {tn} (status, results, tests, "
                               "files) and Decisions/Bugs/History notes if relevant, then finish."}))
             return
-        send({"agent": agent, "task": task, "status": "completed",
-              "files": f"{len(st.get('files', []))} modified", "kb": "Updated" if tn.exists() and tn.stat().st_mtime >= st.get("start", 0) else "NOT updated",
-              "changes": st.get("summary", ""), "title": "Agent turn finished"}, d, cfg)
+        done = tn.exists() and tn.stat().st_mtime >= st.get("start", 0)
+        send({"agent": agent, "task": task, "status": "completed" if done else "failed",
+              "files": f"{len(st.get('files', []))} modified", "kb": "Updated" if done else "NOT updated",
+              "changes": st.get("summary", ""), "title": "Agent turn finished",
+              "note": "" if done else "Stopped without updating its task note (blocked by a permission prompt?). Orchestrator must check the log."}, d, cfg)
     elif a.event == "SessionEnd":
         send({"agent": agent, "task": task, "status": "review", "files": f"{len(st.get('files', []))} modified",
               "title": "Agent session ended", "note": "Orchestrator review required"}, d, cfg)
@@ -385,6 +398,7 @@ PRIMARY_PROMPT = """You are {agent}, a PRIMARY Devin agent on project "{name}" (
    a compact self-contained brief, and tell it to report back to you. Do not spawn more than needed. You remain responsible for results.
 4. Work carefully, root-cause fixes, test every meaningful change, regression-check. Quality over speed. Verify it actually works.
 5. Dependencies: only official/trusted sources, check license + maintainer + known vulns; if suspicious STOP and report 'waiting'.
+5b. Shell: you run headless, so any command that writes OUTSIDE the project root (e.g. /tmp) is refused and kills your run. Put temp files in {root}\.orch\scratch (create it) and keep commands simple.
 6. Never print or store secrets/webhook URLs. No destructive/project-wide risky ops without approval (report 'waiting').
 7. Before finishing: update your task note (status, summary, files, test results), and append to Decisions/Bugs/History/Testing notes if relevant.
    Discord reporting is automatic via hooks; (manual `orch.py report` calls may be denied in headless mode; the hooks suffice).
@@ -462,7 +476,7 @@ def cmd_ensure_devin(a):
     cmdline = f'python "{Path(__file__).resolve()}" hook'
     hooks = cfg.setdefault("hooks", {})
     changed = False
-    for ev in ("SessionStart", "PostToolUse", "Stop", "SessionEnd"):
+    for ev in ("SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"):
         lst = hooks.setdefault(ev, [])
         if not any(cmdline in h.get("command", "") for e in lst for h in e.get("hooks", [])):
             lst.append({"matcher": "", "hooks": [{"type": "command", "command": f"{cmdline} {ev}", "timeout": 20}]})
@@ -483,9 +497,13 @@ def cmd_ensure_claude(a):
     cj = json.loads(txt) if txt else {}
     me = f'python "{Path(__file__).resolve()}"'
     hk, changed = cj.setdefault("hooks", {}), False
-    for ev, m, c in (("SessionStart", "compact|resume", f"{me} context"), ("PostToolUse", "Bash", f"{me} mark")):
+    for ev, m, c in (("SessionStart", "compact|resume", f"{me} context"), ("PostToolUse", "Bash|mcp__orch__orch_dispatch", f"{me} mark"), ("Stop", "", f"{me} stop-guard")):
         lst = hk.setdefault(ev, [])
-        if not any(c in h.get("command", "") for e in lst for h in e.get("hooks", [])):
+        hit = [e for e in lst for h in e.get("hooks", []) if c in h.get("command", "")]
+        if hit:
+            if hit[0].get("matcher") != m:
+                hit[0]["matcher"], changed = m, True
+        else:
             lst.append({"matcher": m, "hooks": [{"type": "command", "command": c}]})
             changed = True
     if changed:
@@ -495,6 +513,62 @@ def cmd_ensure_claude(a):
             bak.write_text(txt, encoding="utf-8")
         cp.write_text(json.dumps(cj, indent=2), encoding="utf-8")
     print("hooks installed" if changed else "ok (already installed)")
+
+
+def summarize_runs(d):
+    rows = []
+    for f in sorted((d / ".orch" / "runs").glob("A?.json")):
+        st = json.loads(f.read_text(encoding="utf-8-sig"))
+        note, status = Path(st.get("task_note", "")), ""
+        if note.is_file():
+            m = re.search(r"^status:\s*(\S+)", note.read_text(encoding="utf-8-sig"), re.M)
+            status = m.group(1) if m else ""
+        log = f.with_suffix(".log")
+        rows.append({"agent": f.stem, "alive": bool(st.get("pid")) and alive(st["pid"]), "task": st.get("task"),
+                     "note_status": status, "files_modified": len(st.get("files", [])),
+                     "log_tail": log.read_text(encoding="utf-8", errors="replace")[-400:].strip() if log.exists() else ""})
+    return rows
+
+
+def cmd_wait(a):
+    """Block until no primary agent is running (or timeout), then print every agent's outcome."""
+    d = find_project(a.project or os.getcwd())
+    t0 = time.time()
+    while active_runs(d) and time.time() - t0 < a.timeout:
+        time.sleep(5)
+    still = active_runs(d)
+    print(json.dumps({"still_running": still, "timed_out": bool(still), "agents": summarize_runs(d)}, indent=1))
+
+
+def cmd_stop_guard(a):
+    """Claude Stop hook: the orchestrator may not end its turn while Devin agents are still running."""
+    if os.environ.get("ORCH_AGENT"):
+        return  # Devin loads the same settings files; it is not the orchestrator
+    ev = json.loads(sys.stdin.buffer.read().decode("utf-8-sig") or "{}")
+    sid = ev.get("session_id", "?")
+    d = find_project(os.environ.get("CLAUDE_PROJECT_DIR") or ev.get("cwd") or os.getcwd())
+    if not d and attached().get(sid):
+        d = find_project(attached()[sid])
+    if not d:
+        return
+    f = STATE / "stopblocks.json"
+    c = json.loads(f.read_text(encoding="utf-8-sig")) if f.exists() else {}
+    o = STATE / "owners.json"
+    owners = json.loads(o.read_text(encoding="utf-8-sig")) if o.exists() else {}
+    running = [x for x in active_runs(d) if owners.get(f"{d}|{x}") == sid]
+    if not running:
+        if sid in c:
+            c.pop(sid)
+            f.write_text(json.dumps(c), encoding="utf-8")
+        return
+    if c.get(sid, 0) >= 60:  # safety valve against an endless loop
+        return
+    c[sid] = c.get(sid, 0) + 1
+    STATE.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(c), encoding="utf-8")
+    print(json.dumps({"decision": "block", "reason": f"Devin agents still running: {running}. Do not end your turn. "
+                      "Call orch_wait, review the results (task notes, logs, changed files), then continue the plan: "
+                      "dispatch the next tasks or give the final report."}))
 
 
 def cmd_unity(a):
@@ -519,7 +593,22 @@ def attached():
 def cmd_mark(a):
     """PostToolUse(Bash) hook: remember which project a chat attached to via /orch, keyed by session_id."""
     ev = json.loads(sys.stdin.buffer.read().decode("utf-8-sig") or "{}")
-    cmd = (ev.get("tool_input") or {}).get("command", "")
+    ti = ev.get("tool_input") or {}
+    import shlex
+    try:
+        tok = shlex.split(ti.get("command", ""), posix=False)
+    except ValueError:
+        tok = []
+    agent = ti.get("agent") if ev.get("tool_name", "").endswith("orch_dispatch") else (
+        tok[tok.index("--agent") + 1].strip(chr(34)) if tok[:1] and "dispatch" in tok[1:3] and tok[0].strip(chr(34)).endswith(("python", "python.exe")) and "--agent" in tok[:-1] else None)
+    dproj = find_project(ti.get("project") or ev.get("cwd") or os.getcwd())
+    if agent and dproj and ev.get("session_id"):  # remember who dispatched, so only that chat is held by the stop guard
+        o = STATE / "owners.json"
+        owners = json.loads(o.read_text(encoding="utf-8-sig")) if o.exists() else {}
+        owners[f"{dproj}|{agent}"] = ev["session_id"]
+        STATE.mkdir(parents=True, exist_ok=True)
+        o.write_text(json.dumps(owners), encoding="utf-8")
+    cmd = ti.get("command", "")
     m = re.search(r'orch\.py"?\s+context\s+--project\s+"([^"]+)"', cmd)
     if m and ev.get("session_id"):
         STATE.mkdir(parents=True, exist_ok=True)
@@ -611,10 +700,12 @@ def main():
     s = sp.add_parser("dispatch"); s.set_defaults(f=cmd_dispatch)
     s.add_argument("--agent", required=True, choices=[f"A{i}" for i in range(1, MAX_PRIMARY + 1)])
     s.add_argument("--note", required=True); s.add_argument("--task"); s.add_argument("--project"); s.add_argument("--cwd")
-    s.add_argument("--model", default="swe-2-max"); s.add_argument("--permission", default="accept-edits")
+    s.add_argument("--model", default="swe-2-max"); s.add_argument("--permission", default="dangerous")
     s = sp.add_parser("runs"); s.add_argument("--project"); s.set_defaults(f=cmd_runs)
     s = sp.add_parser("ensure-devin"); s.set_defaults(f=cmd_ensure_devin)
     s = sp.add_parser("ensure-claude"); s.set_defaults(f=cmd_ensure_claude)
+    s = sp.add_parser("wait"); s.add_argument("--project"); s.add_argument("--timeout", type=int, default=300); s.set_defaults(f=cmd_wait)
+    s = sp.add_parser("stop-guard"); s.set_defaults(f=cmd_stop_guard)
     s = sp.add_parser("unity"); s.add_argument("--url", default="http://127.0.0.1:8080/mcp"); s.set_defaults(f=cmd_unity)
     s = sp.add_parser("status"); s.add_argument("--project"); s.set_defaults(f=cmd_status)
     s = sp.add_parser("webhook-rename"); s.add_argument("name"); s.set_defaults(f=cmd_webhook_rename)

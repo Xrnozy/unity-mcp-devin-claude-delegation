@@ -16,6 +16,8 @@ TOOLS = [
          "task": {"type": "string", "description": "Short task title"}}}},
     {"name": "orch_runs", "description": "How many primary Devin agents are running right now, and which.",
      "inputSchema": {"type": "object", "properties": {"project": {"type": "string", "description": "Project root (optional; defaults to cwd)"}}}},
+    {"name": "orch_wait", "description": "BLOCK until all primary Devin agents finish (or timeout_s, default 240, max 540), then return each agent's outcome: alive, note status, files modified, log tail. Call this after dispatch instead of ending your turn; if timed_out is true call it again.",
+     "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "timeout_s": {"type": "integer", "default": 240}}}},
     {"name": "orch_agent_log", "description": "Tail of a Devin agent's run log (.orch/runs/<agent>.log).",
      "inputSchema": {"type": "object", "required": ["agent"], "properties": {"project": {"type": "string"}, "agent": {"type": "string"}, "chars": {"type": "integer", "default": 3000}}}},
     {"name": "orch_report", "description": "Send a Discord embed + vault log line. channel 'main' for orchestrator-level events, 'dev' for agent activity.",
@@ -26,8 +28,8 @@ TOOLS = [
 ]
 
 
-def run(args):
-    r = subprocess.run([sys.executable, ORCH, *args], capture_output=True, text=True, cwd=os.getcwd(), timeout=60)
+def run(args, timeout=60):
+    r = subprocess.run([sys.executable, ORCH, *args], capture_output=True, text=True, cwd=os.getcwd(), timeout=timeout)
     return (r.stdout + r.stderr).strip() or "(no output)", r.returncode != 0
 
 
@@ -50,6 +52,9 @@ def call(name, a):
         return status(), False
     if name == "orch_runs":
         return run(["runs"])
+    if name == "orch_wait":
+        tmo = min(int(a.get("timeout_s", 240)), 540)
+        return run(["wait", "--timeout", str(tmo)], timeout=tmo + 30)
     if name == "orch_dispatch":
         args = ["dispatch", "--agent", a["agent"], "--note", a["note"]]
         return run(args + (["--task", a["task"]] if a.get("task") else []))

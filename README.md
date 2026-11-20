@@ -22,6 +22,11 @@ Copies the toolkit to `~/.orch`, adds the `/orch` command, registers the `orch` 
 2. Open that folder in Claude Desktop (loads automatically), or paste `/orch "<project path>"` into any chat.
 3. Describe what you want. Claude writes task notes in the vault and dispatches Devin agents.
 
+## Autonomy and safety
+- Claude drives the goal itself: `orch_wait` blocks until agents finish, and a Stop hook keeps the chat that dispatched agents working until they end.
+- **Devin agents run headless in `dangerous` mode** (all tools auto-approved), because headless Devin otherwise dies on the first command it won't auto-approve. A PreToolUse hook blocks `rm -rf`, `git push`, `git reset --hard`, recursive deletes and `pip`/`npm install`, and reports them as "waiting". This is a blocklist, not a sandbox: commands it does not list still run. Change the default in `orch.py` (`--permission`) if you want it stricter.
+- Use ONE orchestrator chat per project; two chats will collide on agents and vault notes.
+
 ## Known limits
 - Tested on one Windows machine (Elderwood Unity project + a throwaway Python project). `install.ps1` is lightly tested. Not tested: 5 agents in parallel, a real context compaction, Claude Desktop UI (CLI only).
 - The code-edit guard only applies to chats opened inside the project folder; elsewhere it is an instruction.
