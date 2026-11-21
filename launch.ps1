@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$ProjectDir, [switch]$NoLaunch, [switch]$Cli, [string]$Session = "")
+param([Parameter(Mandatory)][string]$ProjectDir, [switch]$NoMenu, [switch]$NoLaunch, [switch]$Cli, [string]$Session = "")
 $ErrorActionPreference = "Stop"
 $OrchHome = if ($env:ORCH_HOME) { $env:ORCH_HOME } else { Join-Path $env:USERPROFILE ".orch" }
 $py = Join-Path $OrchHome "bin\orch.py"
@@ -8,17 +8,17 @@ function Warn($m) { Write-Host "  [WARN] $m" -ForegroundColor Yellow }
 function Bad($m)  { Write-Host "  [FAIL] $m" -ForegroundColor Red }
 function Orch { & python $py @args }
 
-Write-Host "`n== Claude/Devin orchestration launcher ==" -ForegroundColor Cyan
+Write-Host "`n== Claude/Devin orchestration control panel ==" -ForegroundColor Cyan
 if (-not (Test-Path $py)) { Bad "Global config missing: $py (set ORCH_HOME or reinstall ~/.orch)"; exit 1 }
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) { Bad "python not found on PATH"; exit 1 }
 
-# 1. detect + initialize project (idempotent; never overwrites, backs up CLAUDE.md before editing)
+# 1. detect + initialize project (idempotent; writes only what is missing or changed; CLAUDE.md is backed up first)
 $initOut = Orch init $root
 if ($LASTEXITCODE -ne 0 -or -not $initOut) { Bad "Project init failed (see error above)"; exit 1 }
 $info = $initOut | ConvertFrom-Json
 Ok "Project: $($info.name)  [$($info.types -join ', ')]"
 Ok "Root:    $($info.root)"
-if ($info.vault_is_default) { Warn "No Obsidian vault found inside project; using $($info.vault). Re-run 'python `"$py`" init `"$root`" --vault <path>' after deleting .orch\project.json to choose another." }
+if ($info.vault_is_default) { Warn "No Obsidian vault found inside project; using $($info.vault)." }
 else { Ok "Vault:   $($info.vault)" }
 if ($info.created) { Warn "First-time setup: created .orch\project.json, vault notes, CLAUDE.md block (backup in .orch\backups if it existed)" }
 
@@ -48,46 +48,67 @@ if ($st.webhook_dev -and $st.webhook_main) { Ok "Discord webhooks: dev=configure
 else { Warn "Discord webhook(s) missing in ~/.orch/secrets.env (dev=$($st.webhook_dev) main=$($st.webhook_main))" }
 if ($st.queued -gt 0) { Ok "Retried queued Discord updates: $(Orch flush)" }
 
-# 5. already-running agents (no duplicate processes are started by this launcher)
-if ($st.running.Count -gt 0) { Warn "Devin agents already running: $($st.running -join ', ')" } else { Ok "No Devin agents running" }
+# 5. running agents are only reported, never touched
+if ($st.running.Count -gt 0) { Warn "Devin agents already running (left alone): $($st.running -join ', ')" } else { Ok "No Devin agents running" }
 
-if (-not $Cli) {
-  $code = '/orch "' + $root + '"'
-  try { Set-Clipboard -Value $code; Ok "Connect code copied to clipboard" } catch {}
-  Write-Host "`n  ALL CONNECTED. In any Claude Desktop chat, paste:" -ForegroundColor Cyan
-  Write-Host "    $code" -ForegroundColor White
-  Write-Host "  That chat becomes the orchestrator for this project (Devin codes, vault remembers).`n"
-  if (-not $NoLaunch) { Pause }
-  exit 0
-}
-if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { Bad "claude CLI not found"; exit 1 }
+# 6. dashboard: one global background server, started only if not already running. Opens nothing.
+$dashUrl = ""
+try { $dashUrl = (Orch dash start | Select-Object -Last 1); Ok "Dashboard server: $dashUrl (background; choose 'Open dashboard' to view)" }
+catch { Warn "Dashboard server could not start (see ~/.orch/state/dash.log)" }
 
-# 6. session menu (arrow keys + Enter). claude.ai session links cannot be attached to CLI sessions.
+if ($NoMenu -or $NoLaunch) { Ok "Setup complete (no menu)"; exit 0 }
+
 function Select-Menu($title, $items) {
-  $i = 0
+  Write-Host "`n$title" -ForegroundColor Cyan
+  Write-Host "  (Up/Down arrows, Enter = select, Esc = quit)"
+  1..$items.Count | ForEach-Object { Write-Host "" }
+  $top = [Console]::CursorTop - $items.Count; $i = 0
   while ($true) {
-    Clear-Host; Write-Host $title -ForegroundColor Cyan; Write-Host "  (Up/Down arrows, Enter to select, Esc to quit)`n"
+    [Console]::SetCursorPosition(0, $top)
     for ($n = 0; $n -lt $items.Count; $n++) {
-      if ($n -eq $i) { Write-Host "  > $($items[$n])" -ForegroundColor Black -BackgroundColor Cyan } else { Write-Host "    $($items[$n])" }
+      $line = ("  " + $(if ($n -eq $i) { "> " } else { "  " }) + $items[$n]).PadRight([Console]::WindowWidth - 1)
+      if ($n -eq $i) { Write-Host $line -ForegroundColor Black -BackgroundColor Cyan } else { Write-Host $line }
     }
-    $k = [Console]::ReadKey($true)
-    switch ($k.Key) {
-      'UpArrow'   { if ($i -gt 0) { $i-- } else { $i = $items.Count - 1 } }
-      'DownArrow' { if ($i -lt $items.Count - 1) { $i++ } else { $i = 0 } }
-      'Enter'     { Clear-Host; return $i }
-      'Escape'    { Clear-Host; return -1 }
+    switch (([Console]::ReadKey($true)).Key) {
+      'UpArrow'   { $i = ($i + $items.Count - 1) % $items.Count }
+      'DownArrow' { $i = ($i + 1) % $items.Count }
+      'Enter'     { return $i }
+      'Escape'    { return -1 }
     }
   }
 }
-$boot = "Orchestrator boot: read the vault 00_Master.md and Active Tasks.md for this project, then summarize current state, active agents and pending work in max 10 lines. Do not write project code."
-$mode = 0
-if ($Session -eq "") {
-  $mode = Select-Menu "$($info.name) - start Claude session" @("New session", "Continue last session", "Pick a previous session (Claude's own list)", "Enter a session name or ID")
-  if ($mode -eq -1) { exit 0 }
-  if ($mode -eq 3) { $Session = Read-Host "Session name or ID" }
+
+function Start-ClaudeHere {
+  if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { Bad "claude CLI not found"; return }
+  $m = Select-Menu "Claude CLI session in $($info.name)" @("New session", "Continue last session", "Pick a previous session (Claude's own list)", "Enter a session name or ID", "Back")
+  if ($m -lt 0 -or $m -eq 4) { return }
+  $boot = "Orchestrator boot: read the vault 00_Master.md and Active Tasks.md for this project, then summarize current state, active agents and pending work in max 10 lines. Do not write project code."
+  Push-Location $root
+  try {
+    if ($m -eq 0) { & claude $boot } elseif ($m -eq 1) { & claude --continue } elseif ($m -eq 2) { & claude --resume }
+    else { $s = Read-Host "Session name or ID"; if ($s) { & claude --resume $s } }
+  } finally { Pop-Location }
 }
-Set-Location $root
-if ($Session) { & claude --resume $Session }
-elseif ($mode -eq 1) { & claude --continue }
-elseif ($mode -eq 2) { & claude --resume }
-else { & claude $boot }
+
+if ($Cli) { Start-ClaudeHere; exit 0 }
+
+$items = @("Open dashboard in browser", "Live view here (agents, subagents, activity, Claude)", "Re-run connection checks",
+           "Copy /orch connect code to clipboard", "Start a Claude CLI session here", "Stop dashboard server", "Quit (leaves dashboard running)")
+$msg = ""; $first = $true
+while ($true) {
+  if (-not $first) { Clear-Host; Write-Host "== $($info.name) control panel ==" -ForegroundColor Cyan }
+  $first = $false
+  $now = Orch status --project $root | ConvertFrom-Json
+  Write-Host ("`n  Agents running: {0}/5 {1}   Dashboard: {2}" -f $now.running.Count, $(if ($now.running.Count) { "(" + ($now.running -join ", ") + ")" } else { "" }), $dashUrl)
+  if ($msg) { Write-Host "  $msg" -ForegroundColor Green; $msg = "" }
+  $c = Select-Menu "What do you want to do?" $items
+  switch ($c) {
+    0 { $msg = (Orch dash open --project $root | Select-Object -Last 1); $dashUrl = $msg -replace '^opened ', '' }
+    1 { Orch watch --project $root }
+    2 { & $PSCommandPath -ProjectDir $root -NoMenu; Write-Host "`n  Press any key to return..."; [void][Console]::ReadKey($true) }
+    3 { Set-Clipboard -Value ('/orch "' + $root + '"'); $msg = "Copied: /orch `"$root`"  (paste it into any Claude chat)" }
+    4 { Start-ClaudeHere }
+    5 { $msg = (Orch dash stop | Select-Object -Last 1); $dashUrl = "(stopped)" }
+    default { exit 0 }
+  }
+}

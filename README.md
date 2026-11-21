@@ -22,6 +22,11 @@ Copies the toolkit to `~/.orch`, adds the `/orch` command, registers the `orch` 
 2. Open that folder in Claude Desktop (loads automatically), or paste `/orch "<project path>"` into any chat.
 3. Describe what you want. Claude writes task notes in the vault and dispatches Devin agents.
 
+## Dashboard and control panel
+`ORCH-START.bat` is an interactive control panel (arrow keys). It checks every connection, starts ONE background dashboard server (127.0.0.1 only, read-only) if none is running, and then offers: open the dashboard, a live terminal view, re-check connections, copy the `/orch` code, start a Claude CLI session, stop the dashboard. It never touches your clipboard, opens a browser, starts Claude or disturbs running agents unless you choose it.
+
+The dashboard (`http://127.0.0.1:8765`) shows every Devin agent and every run it ever had (read from Devin's own session store, `%APPDATA%\devin\cli\sessions.db`, opened read-only), with each run's subagents nested under it, the full chat history rendered as markdown, per-file diffs, the Claude chat with its real Desktop session names, and a light/dark theme. It shows every Devin agent, its subagents (attributed by time span, so overlapping background subagents cannot be told apart), a live activity timeline (edits with diffs, commands, reads), per-file changes, the agent's output, its task note, and the Claude chat of the project. Webhook URLs are redacted from everything it serves.
+
 ## Autonomy and safety
 - Claude drives the goal itself: `orch_wait` blocks until agents finish, and a Stop hook keeps the chat that dispatched agents working until they end.
 - **Devin agents run headless in `dangerous` mode** (all tools auto-approved), because headless Devin otherwise dies on the first command it won't auto-approve. A PreToolUse hook blocks `rm -rf`, `git push`, `git reset --hard`, recursive deletes and `pip`/`npm install`, and reports them as "waiting". This is a blocklist, not a sandbox: commands it does not list still run. Change the default in `orch.py` (`--permission`) if you want it stricter.

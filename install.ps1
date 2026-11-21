@@ -5,7 +5,8 @@ function Need($c) { if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { t
 Need python; Need claude
 if (-not (Get-Command devin -ErrorAction SilentlyContinue)) { Write-Warning "Devin CLI not found: delegation will not work until it is installed and signed in." }
 
-New-Item -ItemType Directory -Force "$dst\bin", "$dst\state", "$env:USERPROFILE\.claude\skills\orch" | Out-Null
+New-Item -ItemType Directory -Force "$dst\bin", "$dst\state", "$dst\dash", "$env:USERPROFILE\.claude\skills\orch" | Out-Null
+Copy-Item "$PSScriptRoot\dash\index.html" "$dst\dash" -Force
 Copy-Item "$PSScriptRoot\bin\*.py" "$dst\bin" -Force
 Copy-Item "$PSScriptRoot\launch.ps1", "$PSScriptRoot\ORCHESTRATOR.md", "$PSScriptRoot\ORCH-START.bat" $dst -Force
 Copy-Item "$PSScriptRoot\skill\orch\SKILL.md" "$env:USERPROFILE\.claude\skills\orch" -Force

@@ -297,6 +297,30 @@ def cmd_report(a):
 
 
 # ---------- Devin hooks (stdin JSON) ----------
+REDACT = re.compile("https://discord(?:app)?[.]com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+")
+
+
+def redact(t):
+    return REDACT.sub("[webhook redacted]", t)
+
+
+def cut(v, n=3000):
+    if isinstance(v, str):
+        return redact(v)[:n]
+    if isinstance(v, dict):
+        return {k: cut(x, n) for k, x in v.items()}
+    if isinstance(v, list):
+        return [cut(x, n) for x in v[:50]]
+    return v
+
+
+def log_event(d, agent, kind, ev):
+    """Append one trimmed, redacted hook event to .orch/runs/<agent>.events.jsonl (feeds the dashboard)."""
+    f = d / ".orch" / "runs" / f"{agent}.events.jsonl"
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"t": time.time(), "kind": kind, "raw": cut(ev)}, ensure_ascii=False) + chr(10))
+
+
 DENY = re.compile(r"(\brm\s+-\w*[rf]\w*\s|\bgit\s+(reset\s+--hard|clean\s+-\w*f|push|restore|checkout\s+--)|\bRemove-Item\b.*-Recurse|\brmdir\s+/s|\bdel\s+/[sq]|\bformat\s+[a-z]:|\b(npm|pnpm|yarn)\s+(i|install|add)\b|\bpip3?\s+install\b|\bcurl\b.*\|\s*(sh|bash)|\bInvoke-Expression\b|\biex\b)", re.I)
 BLOCK_MSG = "Blocked by orchestrator safety policy (destructive command or dependency install). Do not retry. Set your task note status to 'waiting', explain what you need and why, and finish; the orchestrator will ask the user."
 
@@ -313,15 +337,27 @@ def cmd_hook(a):
     agent, task = os.environ["ORCH_AGENT"], os.environ.get("ORCH_TASK", "")
     run = d / ".orch" / "runs" / f"{agent}.json"
     st = json.loads(run.read_text()) if run.exists() else {}
+    if a.event != "PreToolUse":
+        log_event(d, agent, a.event, ev)
     if a.event == "PreToolUse":
+        if (ev.get("tool_name") or "").lower() == "run_subagent":  # span start: events until its PostToolUse are the subagent's
+            log_event(d, agent, "SubStart", ev)
+            st["sub_open"] = st.get("sub_open", 0) + 1
+            run.write_text(json.dumps(st))
+            return
         cmd = (ev.get("tool_input") or {}).get("command") or ""
         if (ev.get("tool_name") or "").lower() in ("exec", "bash", "shell") and DENY.search(cmd):
             send({"agent": agent, "task": task, "status": "waiting", "title": "Blocked risky command",
                   "note": cmd[:200]}, d, cfg)
+            log_event(d, agent, "Blocked", ev)
             print(json.dumps({"decision": "block", "reason": BLOCK_MSG}))
         return
     if a.event == "PostToolUse":
         tool = (ev.get("tool_name") or "").lower()
+        if tool == "run_subagent":
+            st["sub_open"] = max(0, st.get("sub_open", 0) - 1)
+            st["subagents"] = st.get("subagents", 0) + 1
+            run.write_text(json.dumps(st))
         if any(k in tool for k in ("edit", "write", "patch")):
             p = (ev.get("tool_input") or {}).get("file_path") or (ev.get("tool_input") or {}).get("path")
             if p:
@@ -330,6 +366,8 @@ def cmd_hook(a):
                     st["files"].append(p)
                 run.write_text(json.dumps(st))
     elif a.event == "Stop":
+        if st.get("sub_open", 0) > 0:  # a subagent's own Stop: no enforcement, no Discord report
+            return
         # enforce: task note must have been touched by the agent before it may stop (once)
         tn = Path(st.get("task_note", ""))
         if tn.exists() and tn.stat().st_mtime < st.get("start", 0) and not ev.get("stop_hook_active"):
@@ -345,6 +383,9 @@ def cmd_hook(a):
         send({"agent": agent, "task": task, "status": "review", "files": f"{len(st.get('files', []))} modified",
               "title": "Agent session ended", "note": "Orchestrator review required"}, d, cfg)
     elif a.event == "SessionStart":
+        if ev.get("session_id") and st.get("session") != ev["session_id"]:  # lets the dashboard find this run's Devin chat
+            st["session"] = ev["session_id"]
+            run.write_text(json.dumps(st))
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
               f"You are {agent} on project {cfg['name']}. Read {st.get('task_note','your task note')} first; use the vault, "
               "not copied docs. Report via your task note; hooks send Discord updates automatically."}}))
@@ -378,8 +419,16 @@ def cmd_guard(a):
 
 # ---------- dispatch ----------
 def alive(pid):
-    r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True)
-    return str(pid) in r.stdout
+    """True while the process exists and has not exited (Win32 call; tasklist took ~0.8s per check)."""
+    import ctypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = ctypes.c_ulong()
+    ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+    k.CloseHandle(h)
+    return bool(ok) and code.value == 259  # STILL_ACTIVE
 
 
 def active_runs(d):
@@ -394,8 +443,10 @@ def active_runs(d):
 PRIMARY_PROMPT = """You are {agent}, a PRIMARY Devin agent on project "{name}" (root: {root}). You write all code.
 1. Read ONLY: {note} (your task), then notes it links. Vault: {vault}. Check Bugs/Decisions before changing design.
 2. Own ONLY the files/areas named in your task. Do not touch others' areas.
-3. You may delegate independent sub-tasks to 3-4 subagents with run_subagent (profile `orch-sub`); give each a disjoint file set,
-   a compact self-contained brief, and tell it to report back to you. Do not spawn more than needed. You remain responsible for results.
+3. SUBAGENTS: unless the task is trivial (a single small edit), first split it into 2-4 independent slices (disjoint files or disjoint questions) and
+   run each slice as its own subagent with run_subagent (profile `orch-sub`; run independent slices in the background so they work in parallel).
+   Give each a compact self-contained brief and a disjoint file set. Do NOT do every slice serially yourself. Only the Unity Editor is a shared
+   resource: never let two subagents compile or run Unity tests at once. You integrate, verify and stay responsible for the result.
 4. Work carefully, root-cause fixes, test every meaningful change, regression-check. Quality over speed. Verify it actually works.
 5. Dependencies: only official/trusted sources, check license + maintainer + known vulns; if suspicious STOP and report 'waiting'.
 5b. Shell: you run headless, so any command that writes OUTSIDE the project root (e.g. /tmp) is refused and kills your run. Put temp files in {root}\.orch\scratch (create it) and keep commands simple.
@@ -429,6 +480,7 @@ def cmd_dispatch(a):
     lf = open(log, "wb")
     p = subprocess.Popen(cmd, cwd=a.cwd or str(d), env=env, stdout=lf, stderr=subprocess.STDOUT,
                          stdin=subprocess.DEVNULL, creationflags=0x08000000)  # CREATE_NO_WINDOW
+    (runs / f"{a.agent}.events.jsonl").unlink(missing_ok=True)
     (runs / f"{a.agent}.json").write_text(json.dumps({"pid": p.pid, "start": time.time(), "task": a.task or note.stem,
                                                        "task_note": str(note), "files": []}))
     send({"agent": a.agent, "task": a.task or note.stem, "status": "progress", "title": "Work started",
@@ -571,6 +623,110 @@ def cmd_stop_guard(a):
                       "dispatch the next tasks or give the final report."}))
 
 
+def dash_info():
+    try:
+        return json.loads((STATE / "dash.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+
+
+def dash_ping(port):
+    """Returns the dashboard server's pid if one of ours answers on this port, else None."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=1.5) as r:
+            return json.loads(r.read()).get("orch_dash")
+    except Exception:
+        return None
+
+
+def dash_start():
+    """Start the single global dashboard unless it is already running (never a second one). Returns its port."""
+    import socket
+    for port in [dash_info().get("port", 8765), *range(8765, 8775)]:
+        if dash_ping(port):
+            return port
+    for port in range(8765, 8775):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            continue  # taken by something that is not our dashboard
+        finally:
+            s.close()
+        STATE.mkdir(parents=True, exist_ok=True)
+        log = open(STATE / "dash.log", "ab")
+        subprocess.Popen([sys.executable, str(Path(__file__).with_name("dash.py")), "--port", str(port)], stdout=log, stderr=log,
+                         stdin=subprocess.DEVNULL, creationflags=0x208, close_fds=True)  # DETACHED_PROCESS | NEW_PROCESS_GROUP: no window, survives the launcher
+        for _ in range(40):
+            if dash_ping(port):
+                return port
+            time.sleep(0.25)
+        raise SystemExit("dashboard did not start; see ~/.orch/state/dash.log")
+    raise SystemExit("no free port in 8765-8774")
+
+
+def cmd_dash(a):
+    port = dash_info().get("port", 8765)
+    if a.action == "start":
+        port = dash_start()
+        print(f"http://127.0.0.1:{port}")
+    elif a.action == "status":
+        pid = dash_ping(port)
+        print(f"running http://127.0.0.1:{port} pid={pid}" if pid else "stopped")
+    elif a.action == "stop":
+        pid = dash_ping(port)
+        if pid:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+            print("stopped")
+        else:
+            print("not running")
+    elif a.action == "open":
+        import webbrowser
+        from urllib.parse import quote
+        port = dash_start()
+        d = find_project(a.project or os.getcwd())
+        webbrowser.open(f"http://127.0.0.1:{port}/" + (f"?project={quote(str(d))}" if d else ""))
+        print(f"opened http://127.0.0.1:{port}")
+
+
+def cmd_watch(a):
+    """Live terminal view of agents, subagent counts, recent activity and the latest Claude messages (q = quit)."""
+    import dash, msvcrt, shutil
+    d = find_project(a.project or os.getcwd())
+    os.system("")  # enables ANSI colours in the Windows console
+    sys.stdout.reconfigure(errors="replace")  # agent/chat text can hold characters the console codepage lacks
+    ESC = chr(27)
+    col = lambda c, t: f"{ESC}[{c}m{t}{ESC}[0m"
+    DOT = {"progress": "34", "completed": "32", "waiting": "33", "failed": "31", "review": "35"}
+    mins = lambda s: f"{int(s) // 60}m{int(s) % 60:02d}s"
+    while True:
+        st, w = dash.state(d), shutil.get_terminal_size().columns - 2
+        i = st["integrations"]
+        L = [col("1;36", f" ORCHESTRA  {st['project']['name']}") + col("90", "   " + time.strftime("%H:%M:%S")), "",
+             " Unity MCP " + (col("32", "online") if i["unity"] else col("31", "offline") if i["unity"] is False else col("90", "n/a"))
+             + "   Discord " + (col("32", "on") if i["discord_dev"] and i["discord_main"] else col("33", "partial"))
+             + (f"   queued {i['queued']}" if i["queued"] else ""), "", col("1", " Devin agents")]
+        for ag in st["agents"] or []:
+            L.append(f" {col(DOT[ag['status']], chr(9679))} {ag['name']}  {ag['status']:<9} {mins(ag['elapsed']):>7}  {len(ag['files'])} files  {ag['subagents']} sub  {(ag['task'] or '')[:46]}")
+            L += [col("90", "      " + t) for t in ag["recent"][-3:]]
+        if not st["agents"]:
+            L.append(col("90", "  none dispatched yet"))
+        L += ["", col("1", " Claude (latest session)")]
+        if st["claude"]:
+            msgs, _ = dash.claude_msgs(d, st["claude"][0]["id"], -40)
+            for m in msgs[-5:]:
+                txt = (m["text"] or "[" + ", ".join(t["name"] for t in m["tools"]) + "]").replace(chr(10), " ")
+                L.append(f" {col('36' if m['role'] == 'user' else '35', 'you' if m['role'] == 'user' else 'claude')} {txt}")
+        L += ["", col("90", " q = back")]
+        out = chr(10).join(l[:w + 14] if ESC not in l else l for l in L)
+        sys.stdout.write(f"{ESC}[H{ESC}[J{out}{chr(10)}")
+        sys.stdout.flush()
+        for _ in range(15):
+            time.sleep(0.1)
+            if msvcrt.kbhit() and msvcrt.getwch().lower() in ("q", ESC):
+                return
+
+
 def cmd_unity(a):
     """Probe Unity MCP (streamable HTTP initialize). Exit 0 if reachable."""
     body = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26",
@@ -706,6 +862,8 @@ def main():
     s = sp.add_parser("ensure-claude"); s.set_defaults(f=cmd_ensure_claude)
     s = sp.add_parser("wait"); s.add_argument("--project"); s.add_argument("--timeout", type=int, default=300); s.set_defaults(f=cmd_wait)
     s = sp.add_parser("stop-guard"); s.set_defaults(f=cmd_stop_guard)
+    s = sp.add_parser("dash"); s.add_argument("action", choices=["start", "stop", "status", "open"]); s.add_argument("--project"); s.set_defaults(f=cmd_dash)
+    s = sp.add_parser("watch"); s.add_argument("--project"); s.set_defaults(f=cmd_watch)
     s = sp.add_parser("unity"); s.add_argument("--url", default="http://127.0.0.1:8080/mcp"); s.set_defaults(f=cmd_unity)
     s = sp.add_parser("status"); s.add_argument("--project"); s.set_defaults(f=cmd_status)
     s = sp.add_parser("webhook-rename"); s.add_argument("name"); s.set_defaults(f=cmd_webhook_rename)
