@@ -43,8 +43,14 @@ def pin():
         st = json.loads(out)
     except ValueError:
         return None
-    BOUND.setdefault(st.get("root"), st.get("set"))
-    return BOUND.get(st.get("root"))
+    root = st.get("root")
+    if root not in BOUND:
+        # a new chat gets its own set (an empty one is reused), so it never inherits earlier agents
+        try:
+            BOUND[root] = json.loads(_raw(["newset"])[0])["set"]
+        except (ValueError, KeyError):
+            BOUND[root] = st.get("set")
+    return BOUND[root]
 
 
 def run(args, timeout=60):
