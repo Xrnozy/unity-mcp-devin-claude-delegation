@@ -129,7 +129,7 @@ def init_project(d, vault_override=None):
     for sub in ("Tasks", "Agents/Logs", "Reports"):
         (vd / sub).mkdir(parents=True, exist_ok=True)
     (orch / "runs").mkdir(exist_ok=True)
-    (orch / ".gitignore").write_text("runs/\nbackups/\nclaude-settings.json\n", encoding="utf-8")
+    (orch / ".gitignore").write_text("runs/\nbackups/\nscratch/\nsets.json\nclaude-settings.json\n", encoding="utf-8")
     # CLAUDE.md managed block (backup first, never touch text outside the block)
     block = (f"{BEGIN}\n@~/.orch/ORCHESTRATOR.md\n\n## Project: {cfg['name']}\n"
              f"- Types: {', '.join(cfg['types'])}\n- Root: {cfg['root']}\n- Vault notes: {vd}\n"
@@ -316,7 +316,7 @@ def cut(v, n=3000):
 
 def log_event(d, agent, kind, ev):
     """Append one trimmed, redacted hook event to .orch/runs/<agent>.events.jsonl (feeds the dashboard)."""
-    f = d / ".orch" / "runs" / f"{agent}.events.jsonl"
+    f = runs_dir(d, os.environ.get("ORCH_SET") or "S1") / f"{agent}.events.jsonl"
     with f.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"t": time.time(), "kind": kind, "raw": cut(ev)}, ensure_ascii=False) + chr(10))
 
@@ -335,7 +335,7 @@ def cmd_hook(a):
         return
     cfg = load_project(d)
     agent, task = os.environ["ORCH_AGENT"], os.environ.get("ORCH_TASK", "")
-    run = d / ".orch" / "runs" / f"{agent}.json"
+    run = runs_dir(d, os.environ.get("ORCH_SET") or "S1") / f"{agent}.json"
     st = json.loads(run.read_text()) if run.exists() else {}
     if a.event != "PreToolUse":
         log_event(d, agent, a.event, ev)
@@ -431,13 +431,83 @@ def alive(pid):
     return bool(ok) and code.value == 259  # STILL_ACTIVE
 
 
-def active_runs(d):
+def sets_file(d):
+    return d / ".orch" / "sets.json"
+
+
+def load_sets(d):
+    """Agent sets of a project. S1 is the legacy flat run folder, so agents started before sets existed keep working untouched."""
+    f = sets_file(d)
+    try:
+        j = json.loads(f.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        j = None
+    if not j or not j.get("sets"):
+        j = {"current": "S1", "sets": [{"id": "S1", "start": 0, "label": "Earlier work (before agent sets)"}]}
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(j, indent=1), encoding="utf-8")
+    return j
+
+
+def current_set(d):
+    return load_sets(d)["current"]
+
+
+def runs_dir(d, setid=None):
+    s = setid or current_set(d)
+    if not re.fullmatch(r"S[0-9]{1,4}", s):
+        raise SystemExit(f"bad agent set id: {s}")
+    base = d / ".orch" / "runs"
+    p = base if s == "S1" else base / s
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def set_window(d, setid):
+    """(start, end) epoch seconds of a set: it lasts until the next set was created."""
+    sets = load_sets(d)["sets"]
+    ids = [s["id"] for s in sets]
+    i = ids.index(setid) if setid in ids else len(ids) - 1
+    return sets[i]["start"], (sets[i + 1]["start"] if i + 1 < len(sets) else 9e12)
+
+
+def new_set(d, label=""):
+    """Open a fresh agent set (new A1-A5 slots). A set that never got an agent is reused instead of piling up empty ones."""
+    j = load_sets(d)
+    cur = j["current"]
+    if not list(runs_dir(d, cur).glob("A?.json")):
+        return cur, False
+    sid = "S%d" % (max(int(s["id"][1:]) for s in j["sets"]) + 1)
+    j["sets"].append({"id": sid, "start": time.time(), "label": label or time.strftime("%b %d %H:%M")})
+    j["current"] = sid
+    sets_file(d).write_text(json.dumps(j, indent=1), encoding="utf-8")
+    runs_dir(d, sid)
+    return sid, True
+
+
+def active_runs(d, setid=None):
     out = []
-    for f in (d / ".orch" / "runs").glob("A*.json"):
+    for f in runs_dir(d, setid).glob("A*.json"):
         s = json.loads(f.read_text())
         if s.get("pid") and alive(s["pid"]):
             out.append(f.stem)
     return out
+
+
+def other_running(d, setid):
+    """Agents still running in OTHER sets: reported, never touched."""
+    return [f"{s['id']}:{a}" for s in load_sets(d)["sets"] if s["id"] != setid for a in active_runs(d, s["id"])]
+
+
+def find_set_of(d, agent):
+    """The set whose <agent> run was started in the last 90 s (used to attribute a fresh dispatch to a chat)."""
+    for s in reversed(load_sets(d)["sets"]):
+        try:
+            if time.time() - json.loads((runs_dir(d, s["id"]) / f"{agent}.json").read_text(encoding="utf-8-sig")).get("start", 0) < 90:
+                return s["id"]
+        except (OSError, ValueError):
+            pass
+    return current_set(d)
 
 
 PRIMARY_PROMPT = """You are {agent}, a PRIMARY Devin agent on project "{name}" (root: {root}). You write all code.
@@ -460,9 +530,10 @@ Unity MCP (if relevant): http://127.0.0.1:8080/mcp is configured as `unityMCP`.
 def cmd_dispatch(a):
     d = find_project(a.project or os.getcwd())
     cfg = load_project(d)
-    act = active_runs(d)
+    setid = a.set or current_set(d)
+    act = active_runs(d, setid)
     if len(act) >= MAX_PRIMARY:
-        sys.exit(f"REFUSED: {len(act)}/{MAX_PRIMARY} primary agents already running: {act}")
+        sys.exit(f"REFUSED: {len(act)}/{MAX_PRIMARY} primary agents already running in set {setid}: {act}")
     if a.agent in act:
         sys.exit(f"REFUSED: {a.agent} already running")
     note = Path(a.note).resolve()
@@ -470,28 +541,31 @@ def cmd_dispatch(a):
         sys.exit(f"task note not found: {note}")
     prompt = PRIMARY_PROMPT.format(agent=a.agent, name=cfg["name"], root=cfg["root"], note=note,
                                    vault=vault_dir(d, cfg), orch=Path(__file__).resolve(), task=a.task or note.stem)
-    runs = d / ".orch" / "runs"
+    runs = runs_dir(d, setid)
     pf = runs / f"{a.agent}.prompt.md"
     pf.write_text(prompt, encoding="utf-8")
     log = runs / f"{a.agent}.log"
-    env = {**os.environ, "ORCH_AGENT": a.agent, "ORCH_TASK": a.task or note.stem, "ORCH_PROJECT_DIR": str(d)}
-    cmd = ["devin", "-p", "--model", a.model, "--permission-mode", a.permission, "--respect-workspace-trust", "false",
+    env = {**os.environ, "ORCH_AGENT": a.agent, "ORCH_TASK": a.task or note.stem, "ORCH_PROJECT_DIR": str(d), "ORCH_SET": setid}
+    cmd = [os.environ.get("ORCH_DEVIN", "devin"), "-p", "--model", a.model, "--permission-mode", a.permission, "--respect-workspace-trust", "false",
            "--prompt-file", str(pf)]
     lf = open(log, "wb")
     p = subprocess.Popen(cmd, cwd=a.cwd or str(d), env=env, stdout=lf, stderr=subprocess.STDOUT,
                          stdin=subprocess.DEVNULL, creationflags=0x08000000)  # CREATE_NO_WINDOW
     (runs / f"{a.agent}.events.jsonl").unlink(missing_ok=True)
     (runs / f"{a.agent}.json").write_text(json.dumps({"pid": p.pid, "start": time.time(), "task": a.task or note.stem,
-                                                       "task_note": str(note), "files": []}))
+                                                       "task_note": str(note), "files": [], "set": setid}))
     send({"agent": a.agent, "task": a.task or note.stem, "status": "progress", "title": "Work started",
-          "note": f"model {a.model}", "channel": "dev"}, d, cfg)
-    print(f"started {a.agent} pid={p.pid} log={log}")
+          "note": f"model {a.model} | set {setid}", "channel": "dev"}, d, cfg)
+    others = other_running(d, setid)
+    print(f"started {a.agent} pid={p.pid} set={setid} log={log}" + (f" (note: earlier sets still running: {others})" if others else ""))
 
 
 def cmd_runs(a):
     d = find_project(a.project or os.getcwd())
-    act = active_runs(d)
-    print(f"{len(act)}/{MAX_PRIMARY} primary agents running: {act}")
+    setid = a.set or current_set(d)
+    act = active_runs(d, setid)
+    others = other_running(d, setid)
+    print(f"{len(act)}/{MAX_PRIMARY} primary agents running: {act}" + (f" [set {setid}; earlier sets still running: {others}]" if others else f" [set {setid}]"))
 
 
 def cmd_webhook_rename(a):
@@ -567,9 +641,9 @@ def cmd_ensure_claude(a):
     print("hooks installed" if changed else "ok (already installed)")
 
 
-def summarize_runs(d):
+def summarize_runs(d, setid=None):
     rows = []
-    for f in sorted((d / ".orch" / "runs").glob("A?.json")):
+    for f in sorted(runs_dir(d, setid).glob("A?.json")):
         st = json.loads(f.read_text(encoding="utf-8-sig"))
         note, status = Path(st.get("task_note", "")), ""
         if note.is_file():
@@ -585,11 +659,12 @@ def summarize_runs(d):
 def cmd_wait(a):
     """Block until no primary agent is running (or timeout), then print every agent's outcome."""
     d = find_project(a.project or os.getcwd())
+    setid = a.set or current_set(d)
     t0 = time.time()
-    while active_runs(d) and time.time() - t0 < a.timeout:
+    while active_runs(d, setid) and time.time() - t0 < a.timeout:
         time.sleep(5)
-    still = active_runs(d)
-    print(json.dumps({"still_running": still, "timed_out": bool(still), "agents": summarize_runs(d)}, indent=1))
+    still = active_runs(d, setid)
+    print(json.dumps({"set": setid, "still_running": still, "timed_out": bool(still), "agents": summarize_runs(d, setid)}, indent=1))
 
 
 def cmd_stop_guard(a):
@@ -607,7 +682,7 @@ def cmd_stop_guard(a):
     c = json.loads(f.read_text(encoding="utf-8-sig")) if f.exists() else {}
     o = STATE / "owners.json"
     owners = json.loads(o.read_text(encoding="utf-8-sig")) if o.exists() else {}
-    running = [x for x in active_runs(d) if owners.get(f"{d}|{x}") == sid]
+    running = [f"{s['id']}:{x}" for s in load_sets(d)["sets"] for x in active_runs(d, s["id"]) if owners.get(f"{d}|{s['id']}|{x}") == sid]
     if not running:
         if sid in c:
             c.pop(sid)
@@ -761,7 +836,7 @@ def cmd_mark(a):
     if agent and dproj and ev.get("session_id"):  # remember who dispatched, so only that chat is held by the stop guard
         o = STATE / "owners.json"
         owners = json.loads(o.read_text(encoding="utf-8-sig")) if o.exists() else {}
-        owners[f"{dproj}|{agent}"] = ev["session_id"]
+        owners[f"{dproj}|{find_set_of(dproj, agent)}|{agent}"] = ev["session_id"]
         STATE.mkdir(parents=True, exist_ok=True)
         o.write_text(json.dumps(owners), encoding="utf-8")
     cmd = ti.get("command", "")
@@ -808,7 +883,7 @@ def cmd_context(a):
         "ORCHESTRATOR CONTEXT (auto-loaded)",
         f"Project: {cfg['name']} [{', '.join(cfg['types'])}] root={cfg['root']}",
         f"Vault notes: {vd}",
-        f"Primary Devin agents running: {len(active_runs(d))}/{MAX_PRIMARY}",
+        f"Agent set {current_set(d)}: primary Devin agents running {len(active_runs(d))}/{MAX_PRIMARY}" + (f" (earlier sets still running: {other_running(d, current_set(d))})" if other_running(d, current_set(d)) else ""),
         f"Discord: dev={'on' if secret('DISCORD_WEBHOOK_DEV') else 'off'} main={'on' if secret('DISCORD_WEBHOOK_MAIN') else 'off'} | Unity MCP: {unity or 'n/a'}",
         "Status:", status,
         "Active tasks:", body("Active Tasks.md"),
@@ -834,9 +909,30 @@ def cmd_init(a):
 def cmd_status(a):
     d = find_project(a.project or os.getcwd())
     q = STATE / "queue.jsonl"
-    print(json.dumps({"project": load_project(d)["name"] if d else None, "running": active_runs(d) if d else [],
+    setid = (a.set or current_set(d)) if d else None
+    print(json.dumps({"project": load_project(d)["name"] if d else None, "root": str(d) if d else None, "set": setid,
+                      "running": active_runs(d, setid) if d else [], "other_running": other_running(d, setid) if d else [],
                       "webhook_dev": bool(secret("DISCORD_WEBHOOK_DEV")), "webhook_main": bool(secret("DISCORD_WEBHOOK_MAIN")),
                       "queued": len(q.read_text().splitlines()) if q.exists() else 0}))
+
+
+def cmd_newset(a):
+    d = find_project(a.project or os.getcwd())
+    sid, created = new_set(d, a.label or "")
+    print(json.dumps({"set": sid, "created": created, "other_running": other_running(d, sid)}))
+
+
+def cmd_sets(a):
+    d = find_project(a.project or os.getcwd())
+    j = load_sets(d)
+    print(json.dumps({"current": j["current"], "sets": [dict(s, agents=len(list(runs_dir(d, s["id"]).glob("A?.json"))),
+                                                           running=active_runs(d, s["id"])) for s in j["sets"]]}, indent=1))
+
+
+def cmd_log(a):
+    d = find_project(a.project or os.getcwd())
+    f = runs_dir(d, a.set) / f"{a.agent}.log"
+    print(f.read_text(encoding="utf-8", errors="replace")[-a.chars:] if f.exists() else "no log")
 
 
 def main():
@@ -855,17 +951,20 @@ def main():
     s = sp.add_parser("guard"); s.set_defaults(f=cmd_guard)
     s = sp.add_parser("dispatch"); s.set_defaults(f=cmd_dispatch)
     s.add_argument("--agent", required=True, choices=[f"A{i}" for i in range(1, MAX_PRIMARY + 1)])
-    s.add_argument("--note", required=True); s.add_argument("--task"); s.add_argument("--project"); s.add_argument("--cwd")
+    s.add_argument("--note", required=True); s.add_argument("--task"); s.add_argument("--project"); s.add_argument("--cwd"); s.add_argument("--set")
     s.add_argument("--model", default="swe-2-max"); s.add_argument("--permission", default="dangerous")
-    s = sp.add_parser("runs"); s.add_argument("--project"); s.set_defaults(f=cmd_runs)
+    s = sp.add_parser("runs"); s.add_argument("--project"); s.add_argument("--set"); s.set_defaults(f=cmd_runs)
     s = sp.add_parser("ensure-devin"); s.set_defaults(f=cmd_ensure_devin)
     s = sp.add_parser("ensure-claude"); s.set_defaults(f=cmd_ensure_claude)
-    s = sp.add_parser("wait"); s.add_argument("--project"); s.add_argument("--timeout", type=int, default=300); s.set_defaults(f=cmd_wait)
+    s = sp.add_parser("wait"); s.add_argument("--project"); s.add_argument("--set"); s.add_argument("--timeout", type=int, default=300); s.set_defaults(f=cmd_wait)
     s = sp.add_parser("stop-guard"); s.set_defaults(f=cmd_stop_guard)
     s = sp.add_parser("dash"); s.add_argument("action", choices=["start", "stop", "status", "open"]); s.add_argument("--project"); s.set_defaults(f=cmd_dash)
     s = sp.add_parser("watch"); s.add_argument("--project"); s.set_defaults(f=cmd_watch)
     s = sp.add_parser("unity"); s.add_argument("--url", default="http://127.0.0.1:8080/mcp"); s.set_defaults(f=cmd_unity)
-    s = sp.add_parser("status"); s.add_argument("--project"); s.set_defaults(f=cmd_status)
+    s = sp.add_parser("status"); s.add_argument("--project"); s.add_argument("--set"); s.set_defaults(f=cmd_status)
+    s = sp.add_parser("newset"); s.add_argument("--project"); s.add_argument("--label"); s.set_defaults(f=cmd_newset)
+    s = sp.add_parser("sets"); s.add_argument("--project"); s.set_defaults(f=cmd_sets)
+    s = sp.add_parser("log"); s.add_argument("--project"); s.add_argument("--set"); s.add_argument("--agent", required=True); s.add_argument("--chars", type=int, default=3000); s.set_defaults(f=cmd_log)
     s = sp.add_parser("webhook-rename"); s.add_argument("name"); s.set_defaults(f=cmd_webhook_rename)
     a = ap.parse_args()
     a.f(a)

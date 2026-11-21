@@ -120,8 +120,8 @@ def norm(d, rec, sub, subid):
     return e
 
 
-def events(d, agent, since):
-    lines = read_lines(d / ".orch" / "runs" / f"{agent}.events.jsonl")
+def events(d, agent, since, setid=None):
+    lines = read_lines(orch.runs_dir(d, setid) / f"{agent}.events.jsonl")
     out, stack, n = [], [], 0
     for i, l in enumerate(lines):
         try:
@@ -311,9 +311,14 @@ def sub_info(c, sid, heads, sizes):
     return out
 
 
-def roster(d):
-    """Every Devin run per agent slot (A1..A5, newest first) with its subagent count."""
-    runs = {a: agent_runs(d, a) for a in ("A1", "A2", "A3", "A4", "A5")}
+def in_set(d, setid, runs):
+    lo, hi = orch.set_window(d, setid or orch.current_set(d))
+    return [r for r in runs if lo <= r["created"] < hi]
+
+
+def roster(d, setid=None):
+    """Every Devin run of one agent set per slot (A1..A5, newest first) with its subagent count."""
+    runs = {a: in_set(d, setid, agent_runs(d, a)) for a in ("A1", "A2", "A3", "A4", "A5")}
     sids = [r["id"] for rs in runs.values() for r in rs]
     counts = {}
     c = devin_db() if sids else None
@@ -358,9 +363,9 @@ def classify(alive, ns, log_tail):
     return "failed" if "rejected a tool call" in log_tail else "finished"
 
 
-def agents(d):
+def agents(d, setid=None):
     rows = []
-    for f in sorted((d / ".orch" / "runs").glob("A?.json")):
+    for f in sorted(orch.runs_dir(d, setid).glob("A?.json")):
         st = json.loads(f.read_text(encoding="utf-8-sig"))
         name, alive = f.stem, bool(st.get("pid")) and orch.alive(st["pid"])
         ev = f.with_suffix(".events.jsonl")
@@ -487,7 +492,9 @@ def unity_ok(url):
         return False
 
 
-def state(d):
+def state(d, setid=None):
+    sets = orch.load_sets(d)
+    sid = setid if setid in [s["id"] for s in sets["sets"]] else sets["current"]
     cfg = orch.load_project(d)
     vd = orch.vault_dir(d, cfg)
     at = vd / "Active Tasks.md"
@@ -495,7 +502,10 @@ def state(d):
     q = orch.STATE / "queue.jsonl"
     unity = cfg.get("mcp", {}).get("unity")
     return {"now": time.time(), "project": {"name": cfg["name"], "path": str(d), "types": cfg["types"]},
-            "agents": agents(d), "tasks": tasks, "claude": claude_sessions(d),
+            "agents": agents(d, sid), "tasks": tasks, "claude": claude_sessions(d),
+            "set": sid, "current": sets["current"], "other_running": orch.other_running(d, sid),
+            "sets": [{"id": s["id"], "start": s["start"], "label": s["label"], "agents": len(list(orch.runs_dir(d, s["id"]).glob("A?.json"))),
+                      "running": len(orch.active_runs(d, s["id"]))} for s in sets["sets"]][::-1],
             "integrations": {"unity": None if not unity else cached("unity", 15, lambda: unity_ok(unity)),
                              "discord_dev": bool(orch.secret("DISCORD_WEBHOOK_DEV")), "discord_main": bool(orch.secret("DISCORD_WEBHOOK_MAIN")),
                              "queued": len(read_lines(q))}}
@@ -536,28 +546,31 @@ class H(BaseHTTPRequestHandler):
             if d is None:
                 return self.js({"error": "unknown project"}, 404)
             agent = (q.get("agent") or [""])[0]
+            setid = (q.get("set") or [None])[0]
+            if setid and setid not in [s["id"] for s in orch.load_sets(d)["sets"]]:
+                setid = None
             if u.path in ("/api/events", "/api/log", "/api/note") and not re.fullmatch(r"A[1-5]", agent):
                 return self.js({"error": "bad agent"}, 400)
             if u.path == "/api/state":
-                return self.js(state(d))
+                return self.js(state(d, setid))
             if u.path == "/api/events":
-                ev, nxt = events(d, agent, int((q.get("since") or ["0"])[0]))
+                ev, nxt = events(d, agent, int((q.get("since") or ["0"])[0]), setid)
                 return self.js({"events": ev, "next": nxt})
             if u.path == "/api/log":
-                f = d / ".orch" / "runs" / f"{agent}.log"
+                f = orch.runs_dir(d, setid) / f"{agent}.log"
                 return self.js({"text": f.read_text(encoding="utf-8", errors="replace")[-20000:] if f.exists() else ""})
             if u.path == "/api/note":
-                rj = d / ".orch" / "runs" / f"{agent}.json"
+                rj = orch.runs_dir(d, setid) / f"{agent}.json"
                 note = Path(json.loads(rj.read_text(encoding="utf-8-sig")).get("task_note", "")) if rj.exists() else None
                 ok = note and note.is_file() and (d.resolve() in note.resolve().parents)
                 return self.js({"path": rel(d, note) if ok else "", "text": note.read_text(encoding="utf-8-sig")[:30000] if ok else ""})
             if u.path == "/api/roster":
-                return self.js(roster(d))
+                return self.js(roster(d, setid))
             if u.path == "/api/subs":
                 return self.js(subs_of(d, (q.get("session") or [""])[0]))
             if u.path == "/api/runs":
                 a = (q.get("agent") or [""])[0]
-                return self.js(agent_runs(d, a) if re.fullmatch(r"A[1-5]", a) else [])
+                return self.js(in_set(d, setid, agent_runs(d, a)) if re.fullmatch(r"A[1-5]", a) else [])
             if u.path == "/api/history":
                 return self.js(history(d, (q.get("session") or [""])[0], int((q.get("since") or ["-1"])[0]), int((q.get("before") or ["0"])[0])))
             if u.path == "/api/claude":

@@ -58,6 +58,15 @@ catch { Warn "Dashboard server could not start (see ~/.orch/state/dash.log)" }
 
 if ($NoMenu -or $NoLaunch) { Ok "Setup complete (no menu)"; exit 0 }
 
+# 7. every interactive launch opens a fresh agent set (new A1-A5 slots, its own dashboard view).
+#    Agents still running in earlier sets are reported and left alone.
+try {
+  $ns = Orch newset --project $root | ConvertFrom-Json
+  if ($ns.created) { Ok "New agent set $($ns.set): fresh A1-A5 slots (earlier sets stay viewable in the dashboard)" }
+  else { Ok "Agent set $($ns.set): reused, no agent has been started in it yet" }
+  if ($ns.other_running.Count -gt 0) { Warn "Agents still running in earlier sets (left alone): $($ns.other_running -join ', ')" }
+} catch { Warn "Could not open a new agent set: $($_.Exception.Message)" }
+
 function Select-Menu($title, $items) {
   Write-Host "`n$title" -ForegroundColor Cyan
   Write-Host "  (Up/Down arrows, Enter = select, Esc = quit)"
@@ -99,7 +108,7 @@ while ($true) {
   if (-not $first) { Clear-Host; Write-Host "== $($info.name) control panel ==" -ForegroundColor Cyan }
   $first = $false
   $now = Orch status --project $root | ConvertFrom-Json
-  Write-Host ("`n  Agents running: {0}/5 {1}   Dashboard: {2}" -f $now.running.Count, $(if ($now.running.Count) { "(" + ($now.running -join ", ") + ")" } else { "" }), $dashUrl)
+  Write-Host ("`n  Agent set {3} | running: {0}/5 {1}   Dashboard: {2}" -f $now.running.Count, $(if ($now.running.Count) { "(" + ($now.running -join ", ") + ")" } else { "" }), $dashUrl, $now.set)
   if ($msg) { Write-Host "  $msg" -ForegroundColor Green; $msg = "" }
   $c = Select-Menu "What do you want to do?" $items
   switch ($c) {

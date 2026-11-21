@@ -81,6 +81,8 @@ h2 small{font-size:12px;letter-spacing:0;text-transform:none;font-weight:400;ove
 .agent:hover{background:var(--soft)}
 .agent[aria-current="true"]{background:var(--soft);border-inline-start-color:var(--accent)}
 .agent[aria-current="true"] .nm{font-weight:700}
+.other{color:var(--wait);font-size:12px;font-weight:600}
+.other:empty{display:none}
 .agents>li{border-block-end:1px solid var(--line)}
 .agents .agent{border-block-end:0}
 .runs{padding:0 0 .5rem 1.25rem}
@@ -193,6 +195,9 @@ article.subcard .meta{margin-block-end:.6rem}
   <h1>Orchestra</h1>
   <label class="visually-hidden" for="proj">Project</label>
   <select id="proj"></select>
+  <label class="visually-hidden" for="setsel">Agent set</label>
+  <select id="setsel"></select>
+  <span id="c-other" class="other"></span>
   <div class="status" aria-label="Connections">
     <span id="c-unity"></span><span id="c-discord"></span><span id="c-live"><i class="live-dot" aria-hidden="true">●</i> Live</span>
     <button type="button" class="btn" id="theme"><span class="to-dark"><span aria-hidden="true">☾</span><span class="visually-hidden">Switch to dark theme</span></span><span class="to-light"><span aria-hidden="true">☀</span><span class="visually-hidden">Switch to light theme</span></span></button>
@@ -229,7 +234,8 @@ const STAT={progress:["●","Working"],completed:["✓","Completed"],waiting:["!
 const ICON={edit:"✎",exec:"$",read:"·",search:"⌕",sub_end:"↳",tool:"⚙",todo:"☑",msg:"›",other:"·"};
 let project=new URLSearchParams(location.search).get("project")||"",S=null,sel=null,tab="activity",chatSess=null;
 const hist={},chat={},runsCache={},runSel={},openKeys=new Set();
-const api=async(p,q)=>{const u=new URL(p,location.origin);for(const[k,v]of Object.entries(q||{}))u.searchParams.set(k,v);const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json()};
+let setId=null; // null = follow the project's current agent set; a value pins an earlier set for viewing
+const api=async(p,q)=>{const u=new URL(p,location.origin);for(const[k,v]of Object.entries(q||{}))u.searchParams.set(k,v);if(setId)u.searchParams.set("set",setId);const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json()};
 const dur=s=>{s=Math.max(0,Math.round(s));const m=Math.floor(s/60);return m>=60?Math.floor(m/60)+"h "+m%60+"m":m?m+"m "+s%60+"s":s+"s"};
 const clock=t=>new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
 const stamp=t=>new Date(t*1000).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
@@ -304,13 +310,22 @@ async function loadProjects(){
   el.value=project;
   el.onchange=()=>{project=el.value;sel=null;chatSess=null;for(const o of[hist,chat,runsCache,runSel])for(const k in o)delete o[k];tick()};
 }
+const resetSetCaches=()=>{for(const o of[hist,runsCache,runSel,subFilter,subsCache])for(const k in o)delete o[k];rosterC=null;agentSig="";sel=null};
 function renderTop(){
+  if(S.sets){
+    const el=$("#setsel"),sig=S.sets.map(x=>[x.id,x.agents,x.running].join(":")).join()+S.set+S.current;
+    if(el.dataset.sig!==sig){el.dataset.sig=sig;el.replaceChildren(...S.sets.map(x=>h("option",{value:x.id},(x.id===S.current?"Current set ":"Set ")+x.id.slice(1)+" · "+(x.id==="S1"&&!x.start?"earlier work":x.label)+" · "+x.agents+" agents"+(x.running?" · "+x.running+" running":""))))}
+    el.value=S.set;el.hidden=S.sets.length<2;
+    el.onchange=()=>{setId=el.value===S.current?null:el.value;resetSetCaches();tick()};
+    const o=$("#c-other");o.textContent=S.other_running?.length?`${S.other_running.length} agent${S.other_running.length>1?"s":""} still running in other sets`:"";o.title=(S.other_running||[]).join(", ");
+    if(lastSet!==null&&lastSet!==S.set){resetSetCaches()} lastSet=S.set;
+  }
   const i=S.integrations;
   $("#c-unity").textContent=i.unity===null?"Unity: n/a":i.unity?"● Unity MCP online":"○ Unity MCP offline";
   $("#c-discord").textContent=(i.discord_dev&&i.discord_main?"● Discord":"○ Discord incomplete")+(i.queued?` (${i.queued} queued)`:"");
 }
 /* roster tree: agent slot -> every run it ever had -> that run's subagents (loaded when a run is opened) */
-const subFilter={},subsCache={};let rosterC=null,agentSig="";
+const subFilter={},subsCache={};let rosterC=null,agentSig="",lastSet=null;
 async function getRoster(){if(rosterC&&Date.now()-rosterC.t<6000)return rosterC.v;const v=await api("/api/roster",{project});rosterC={t:Date.now(),v};return v}
 async function getSubs(sid){const c=subsCache[sid];if(c&&Date.now()-c.t<8000)return c.v;const v=await api("/api/subs",{project,session:sid});subsCache[sid]={t:Date.now(),v};return v}
 const curSid=slot=>runSel[slot]||S.agents.find(x=>x.name===slot)?.session;
@@ -335,7 +350,10 @@ async function renderAgents(){
   const live=S.agents,slots=[...live,...Object.keys(roster).filter(n=>!live.some(x=>x.name===n)).map(n=>({name:n,status:"finished",task:"(earlier runs)",elapsed:0,files:[],subagents:0,recent:[],session:null}))].sort((a,b)=>a.name.localeCompare(b.name));
   const runsN=Object.values(roster).reduce((n,v)=>n+v.length,0),subsN=Object.values(roster).reduce((n,v)=>n+v.reduce((m,r)=>m+r.subs,0),0);
   $("#agcount").textContent=`${live.filter(x=>x.alive).length} running · ${runsN} runs · ${subsN} subagents`;
-  if(!slots.length){box.replaceChildren(h("p",{class:"empty"},"No agents dispatched yet."));return}
+  if(!slots.length){
+    box.replaceChildren(h("p",{class:"empty"},"No agents in this set yet."));
+    $("#h-detail").textContent="Select an agent";$("#run").replaceChildren();$("#run").dataset.sig="";sel=null;
+    $("#detail").replaceChildren(h("p",{class:"empty"},"A new agent set starts empty. Agents appear here when Claude dispatches them."));return}
   if(!sel||!slots.some(x=>x.name===sel))sel=(live.find(x=>x.alive)||slots[0]).name;
   const sig=JSON.stringify([slots.map(x=>[x.name,x.status,x.subagents,x.files.length,Math.round(x.elapsed/20),x.task,x.recent.slice(-1)]),Object.values(roster).map(v=>v.map(r=>[r.id,r.subs])),sel]);
   if(sig===agentSig&&box.childElementCount)return;

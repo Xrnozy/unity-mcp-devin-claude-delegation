@@ -28,9 +28,31 @@ TOOLS = [
 ]
 
 
-def run(args, timeout=60):
+BOUND = {}  # project root -> agent set this chat is pinned to
+
+
+def _raw(args, timeout=60):
     r = subprocess.run([sys.executable, ORCH, *args], capture_output=True, text=True, cwd=os.getcwd(), timeout=timeout)
     return (r.stdout + r.stderr).strip() or "(no output)", r.returncode != 0
+
+
+def pin():
+    """Pin this chat to the project's agent set the first time it touches it (at MCP start), so a later launcher click that opens a new set cannot move it."""
+    out = _raw(["status"])[0]
+    try:
+        st = json.loads(out)
+    except ValueError:
+        return None
+    BOUND.setdefault(st.get("root"), st.get("set"))
+    return BOUND.get(st.get("root"))
+
+
+def run(args, timeout=60):
+    if args[0] in ("dispatch", "runs", "wait", "log", "status"):
+        s = pin()
+        if s:
+            args = [*args, "--set", s]
+    return _raw(args, timeout)
 
 
 def status():
@@ -59,9 +81,7 @@ def call(name, a):
         args = ["dispatch", "--agent", a["agent"], "--note", a["note"]]
         return run(args + (["--task", a["task"]] if a.get("task") else []))
     if name == "orch_agent_log":
-        root = os.getcwd()
-        f = Path(root) / ".orch" / "runs" / f"{a['agent']}.log"
-        return (f.read_text(encoding="utf-8", errors="replace")[-int(a.get("chars", 3000)):] if f.exists() else "no log"), False
+        return run(["log", "--agent", a["agent"], "--chars", str(int(a.get("chars", 3000)))])
     if name == "orch_report":
         args = ["report"]
         for k, v in a.items():
@@ -79,6 +99,7 @@ def main():
         if mid is None:
             continue  # notification
         if meth == "initialize":
+            pin()
             res = {"protocolVersion": m["params"].get("protocolVersion", "2025-03-26"), "capabilities": {"tools": {}},
                    "serverInfo": {"name": "orch", "version": "1.0"}}
         elif meth == "tools/list":
