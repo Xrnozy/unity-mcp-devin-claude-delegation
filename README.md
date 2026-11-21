@@ -18,14 +18,14 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 Copies the toolkit to `~/.orch`, adds the `/orch` command, registers the `orch` MCP tools, and merges hooks into your Claude and Devin configs (existing files are backed up). Webhooks are asked once and stored only in `~/.orch/secrets.env`.
 
 ## Use
-1. Copy `~/.orch/ORCH-START.bat` into any project folder and double-click it. It detects the project, creates its vault notes, checks Devin/Unity/Discord, and copies a connect code to your clipboard.
-2. Open that folder in Claude Desktop (loads automatically), or paste `/orch "<project path>"` into any chat.
+1. Copy `~/.orch/ORCH-START.bat` into any project folder and double-click it. It detects the project, creates its vault notes, checks Devin/Unity/Discord, and starts the dashboard in the background.
+2. Open that folder in Claude Desktop (loads automatically), or choose "Copy /orch connect code" in the launcher menu and paste `/orch "<project path>"` into any chat.
 3. Describe what you want. Claude writes task notes in the vault and dispatches Devin agents.
 
 ## Dashboard and control panel
 `ORCH-START.bat` is an interactive control panel (arrow keys). It checks every connection, starts ONE background dashboard server (127.0.0.1 only, read-only) if none is running, and then offers: open the dashboard, a live terminal view, re-check connections, copy the `/orch` code, start a Claude CLI session, stop the dashboard. It never touches your clipboard, opens a browser, starts Claude or disturbs running agents unless you choose it.
 
-The dashboard (`http://127.0.0.1:8765`) shows every Devin agent and every run it ever had (read from Devin's own session store, `%APPDATA%\devin\cli\sessions.db`, opened read-only), with each run's subagents nested under it, the full chat history rendered as markdown, per-file diffs, the Claude chat with its real Desktop session names, and a light/dark theme. It shows every Devin agent, its subagents (attributed by time span, so overlapping background subagents cannot be told apart), a live activity timeline (edits with diffs, commands, reads), per-file changes, the agent's output, its task note, and the Claude chat of the project. Webhook URLs are redacted from everything it serves.
+The dashboard (`http://127.0.0.1:8765`) shows every Devin agent and every run it ever had (read from Devin's own session store, `%APPDATA%\devin\cli\sessions.db`, opened read-only), with each run's subagents nested under it, the full chat history rendered as markdown, per-file diffs, the Claude chat with its real Desktop session names, and a light/dark theme. Tabs per run: Activity, Changes, Subagents, Output, Task note. Webhook URLs are redacted from everything it serves. Subagents that Devin runs in the background may only appear once Devin records them.
 
 ## Autonomy and safety
 - Claude drives the goal itself: `orch_wait` blocks until agents finish, and a Stop hook keeps the chat that dispatched agents working until they end.
